@@ -1,0 +1,22 @@
+# OS & Editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
+
+# Node / Python / Temp
+node_modules/
+__pycache__/
+*.pyc
+*.log
+*.tmp
+
+# Heavy OMNeT++ raw simulation dumps (if copied into workspace)
+*.sca
+*.vec
+*.vci
+*.elog
+graph.jsonl
