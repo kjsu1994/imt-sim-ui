@@ -1,4 +1,4 @@
-// Interactive 2D Map & Route Replay Controller
+// Interactive 2D Map, Route Replay & Simulator Runner Controller
 const canvas = document.getElementById("mapCanvas");
 const ctx = canvas.getContext("2d");
 const W = 2160, H = 1080;
@@ -9,8 +9,8 @@ const earthImg = new Image();
 earthImg.src = "data/earth.png";
 earthImg.onload = () => render();
 
-let simTime = 1210.0, playing = false, speed = 10, selectedRouteId = null, lastFrame = 0;
-let routes = window.ROUTES || []; // [time, routeId, srcId, dstId, hops, totalMs, pathArr]
+let simTime = 1210.0, maxSimTime = 5700.0, playing = false, speed = 10, selectedRouteId = null, lastFrame = 0;
+let routes = window.ROUTES || [];
 let lastSatStates = [], lastStationStates = [];
 
 // Populate station filter dropdowns
@@ -48,8 +48,8 @@ function drawWrappedLine(lon1, lat1, lon2, lat2, color, width, alpha = 1) {
 }
 
 function drawFootprint(latDeg, lonDeg, altKm) {
-  const Re = 6371, el = 10 * DEG;
-  const psi = Math.acos(Re / (Re + altKm) * Math.cos(el)) - el;
+  const Re = 6371, el = ORBIT_CFG.minEl * DEG;
+  const psi = Math.acos(Math.min(1, Re / (Re + altKm) * Math.cos(el))) - el;
   const lat0 = latDeg * DEG, lon0 = lonDeg * DEG;
   ctx.save();
   ctx.strokeStyle = "rgba(240,196,25,0.65)";
@@ -80,7 +80,6 @@ function drawFootprint(latDeg, lonDeg, altKm) {
   ctx.restore();
 }
 
-// Binary search upper bound for routes up to t
 function upperBoundTime(t) {
   let lo = 0, hi = routes.length;
   while (lo < hi) {
@@ -92,7 +91,6 @@ function upperBoundTime(t) {
 }
 
 function render() {
-  // 1. Background & Grid
   ctx.fillStyle = "#0d2240";
   ctx.fillRect(0, 0, W, H);
   if (earthImg.complete && earthImg.naturalWidth) ctx.drawImage(earthImg, 0, 0, W, H);
@@ -107,7 +105,6 @@ function render() {
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
   }
 
-  // 2. Compute Satellites & Stations at simTime
   const sats = SATS.map(s => getSatState(s, simTime));
   const gmst = sats[0].gmst;
   const stStates = STATIONS.map(st => {
@@ -117,24 +114,21 @@ function render() {
   lastSatStates = sats;
   lastStationStates = stStates;
 
-  // 3. Compute Active GSLs (elevation >= 10 deg)
   const gslLinks = [];
   const gslSatSet = new Set();
   for (const st of stStates) {
     for (const sat of sats) {
-      if (getElevationDeg(st.eci, sat) >= 10.0) {
+      if (getElevationDeg(st.eci, sat) >= ORBIT_CFG.minEl) {
         gslLinks.push([st, sat]);
         gslSatSet.add(sat.idx);
       }
     }
   }
 
-  // 4. Footprints (for GSL-connected satellites)
   if (document.getElementById("chkFoot").checked) {
     gslSatSet.forEach(idx => drawFootprint(sats[idx].lat, sats[idx].lon, sats[idx].alt));
   }
 
-  // 5. ISLs (+Grid: intra-plane blue, inter-plane grey)
   if (document.getElementById("chkIsl").checked) {
     for (const s of sats) {
       const nextInPlane = sats[s.plane * SATS_PER_PLANE + ((s.satInPlane + 1) % SATS_PER_PLANE)];
@@ -144,14 +138,12 @@ function render() {
     }
   }
 
-  // 6. GSLs (Fixed=green, Mobile=cyan)
   if (document.getElementById("chkGsl").checked) {
     for (const [st, sat] of gslLinks) {
       drawWrappedLine(st.lon, st.lat, sat.lon, sat.lat, st.mobile ? "#00d0ff" : "#22b14c", 2, 0.9);
     }
   }
 
-  // 7. Filter & Collect Active Routes in [simTime - 30s, simTime]
   const endIdx = upperBoundTime(simTime);
   const srcF = parseInt(srcFilter.value, 10), dstF = parseInt(dstFilter.value, 10);
   const windowRoutes = [];
@@ -166,16 +158,19 @@ function render() {
   if (document.getElementById("chkRoutes").checked) {
     drawnRoutes.forEach((r, idx) => {
       const [t, rId, srcId, dstId, hops, ms, path] = r;
+      const srcSt = stStates[srcId] || stStates[0], dstSt = stStates[dstId] || stStates[0];
       const age = Math.max(0, simTime - t);
       const alpha = selectedRouteId === rId ? 1.0 : Math.max(0.15, 1.0 - age / ROUTE_LIFETIME);
       const color = ROUTE_COLORS[idx % ROUTE_COLORS.length];
       const width = selectedRouteId === rId ? 6 : 4;
-      const pts = [[stStates[srcId].lon, stStates[srcId].lat]];
+      const pts = [[srcSt.lon, srcSt.lat]];
       path.forEach(satIdx => {
-        activeSatSet.add(satIdx);
-        pts.push([sats[satIdx].lon, sats[satIdx].lat]);
+        if (sats[satIdx]) {
+          activeSatSet.add(satIdx);
+          pts.push([sats[satIdx].lon, sats[satIdx].lat]);
+        }
       });
-      pts.push([stStates[dstId].lon, stStates[dstId].lat]);
+      pts.push([dstSt.lon, dstSt.lat]);
       for (let i = 1; i < pts.length; i++) {
         drawWrappedLine(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1], color, width, alpha);
       }
@@ -184,13 +179,12 @@ function render() {
         ctx.font = "bold 14px sans-serif";
         ctx.fillStyle = color;
         ctx.globalAlpha = alpha;
-        ctx.fillText(`${stStates[srcId].name} -> ${stStates[dstId].name}  ${hops} ISL hops  ${ms.toFixed(1)} ms`, lonToX(pts[0][0]) + 10, latToY(pts[0][1]) - 12);
+        ctx.fillText(`${srcSt.name} -> ${dstSt.name}  ${hops} ISL hops  ${ms.toFixed(1)} ms`, lonToX(pts[0][0]) + 10, latToY(pts[0][1]) - 12);
         ctx.restore();
       }
     });
   }
 
-  // 8. Draw Satellites
   for (const s of sats) {
     ctx.beginPath();
     ctx.arc(lonToX(s.lon), latToY(s.lat), 4, 0, TWOPI);
@@ -203,7 +197,6 @@ function render() {
     }
   }
 
-  // 9. Draw Stations & Mobile Nodes
   const showLabels = document.getElementById("chkLabels").checked;
   for (const st of stStates) {
     const x = lonToX(st.lon), y = latToY(st.lat);
@@ -234,7 +227,6 @@ function render() {
     ctx.restore();
   }
 
-  // 10. Top-left HUD overlay (identical to mapvis)
   let sumMs = 0, sumHops = 0;
   for (let i = 0; i < endIdx; i++) { sumHops += routes[i][4]; sumMs += routes[i][5]; }
   const avgMs = endIdx ? (sumMs / endIdx).toFixed(1) : "0.0";
@@ -247,9 +239,8 @@ function render() {
   ctx.fillText(`t = ${simTime.toFixed(0)} s`, 18, 30);
   ctx.fillText(`satellites ${sats.length}   ISL 264   ground links ${gslLinks.length}`, 18, 50);
   ctx.fillText(`from stations ${endIdx} sent / ${endIdx} delivered, ${avgMs} ms`, 18, 70);
-  ctx.fillText(`routing Sat_Net_DijkstraRouting (delay)`, 18, 90);
+  ctx.fillText(`routing Sat_Net_DijkstraRouting (${document.getElementById("cfgMetric").value})`, 18, 90);
 
-  // 11. Update Sidebar KPIs & Route Table
   document.getElementById("timeLabel").textContent = `t = ${simTime.toFixed(1)} s`;
   document.getElementById("timeSlider").value = simTime;
   document.getElementById("kpiGsl").textContent = gslLinks.length;
@@ -271,12 +262,11 @@ function render() {
   }).join("");
 }
 
-// Animation & Event Listeners
 function loop(ts) {
   if (playing) {
     const dt = lastFrame ? (ts - lastFrame) / 1000 : 0;
-    simTime = Math.min(5700, simTime + dt * speed);
-    if (simTime >= 5700) { playing = false; document.getElementById("btnPlay").textContent = "▶ Play"; }
+    simTime = Math.min(maxSimTime, simTime + dt * speed);
+    if (simTime >= maxSimTime) { playing = false; document.getElementById("btnPlay").textContent = "▶ Play"; }
     render();
   }
   lastFrame = ts;
@@ -289,8 +279,8 @@ document.getElementById("btnPlay").onclick = e => {
   e.target.textContent = playing ? "⏸ Pause" : "▶ Play";
 };
 document.getElementById("btnStepBack").onclick = () => { simTime = Math.max(0, simTime - 1); render(); };
-document.getElementById("btnStepFwd").onclick = () => { simTime = Math.min(5700, simTime + 1); render(); };
-document.getElementById("btnSnap").onclick = () => { simTime = 1210; selectedRouteId = null; render(); };
+document.getElementById("btnStepFwd").onclick = () => { simTime = Math.min(maxSimTime, simTime + 1); render(); };
+document.getElementById("btnSnap").onclick = () => { simTime = Math.min(maxSimTime, 1210); selectedRouteId = null; render(); };
 document.getElementById("timeSlider").oninput = e => { simTime = parseFloat(e.target.value); render(); };
 document.getElementById("speedSel").onchange = e => { speed = parseFloat(e.target.value); };
 ["chkIsl", "chkGsl", "chkFoot", "chkRoutes", "chkLabels", "srcFilter", "dstFilter"].forEach(id => {
@@ -349,9 +339,96 @@ document.getElementById("csvInput").onchange = e => {
       const r = l.split(",");
       return [parseFloat(r[0]), parseInt(r[1], 10), parseInt(r[2].replace("GS", ""), 10), parseInt(r[3], 10), parseInt(r[6], 10), parseFloat(r[9]), r[10].split("-").map(Number)];
     });
+    if (routes.length) {
+      maxSimTime = Math.ceil(routes[routes.length - 1][0]);
+      document.getElementById("timeSlider").max = maxSimTime;
+      simTime = Math.min(simTime, maxSimTime);
+    }
     render();
   };
   reader.readAsText(file);
+};
+
+// ---- Local Backend API Integration (server.py) ----
+const runStatus = document.getElementById("runStatus");
+function setStatus(msg) {
+  runStatus.hidden = !msg;
+  runStatus.textContent = msg;
+}
+
+function getFormPayload() {
+  return {
+    configName: document.getElementById("cfgName").value,
+    metric: document.getElementById("cfgMetric").value,
+    simTimeLimit: parseFloat(document.getElementById("cfgSimTime").value),
+    sendInterval: parseFloat(document.getElementById("cfgSendInt").value),
+    minimumElevation: parseFloat(document.getElementById("cfgMinEl").value),
+    altitude: parseFloat(document.getElementById("cfgAlt").value)
+  };
+}
+
+function applyLoadedConfig(cfg) {
+  if (!cfg) return;
+  document.getElementById("cfgMetric").value = cfg.metric || "delay";
+  document.getElementById("cfgSimTime").value = cfg.simTimeLimit || 600;
+  document.getElementById("cfgSendInt").value = cfg.sendInterval || 2;
+  document.getElementById("cfgMinEl").value = cfg.minimumElevation || 10;
+  document.getElementById("cfgAlt").value = cfg.altitude || 550;
+  updateOrbitConfig({ altitude: cfg.altitude, inclination: cfg.inclination, minEl: cfg.minimumElevation });
+  document.getElementById("topBadge").textContent =
+    `Walker-Delta 132/12/1 · ${ORBIT_CFG.altitude}km · ${ORBIT_CFG.inclination}° · Dijkstra (${cfg.metric})`;
+  render();
+}
+
+if (location.protocol.startsWith("http")) {
+  fetch("/api/config").then(r => r.json()).then(applyLoadedConfig).catch(() => {});
+}
+
+document.getElementById("btnOpenIni").onclick = async () => {
+  if (!location.protocol.startsWith("http")) {
+    return setStatus("⚠️ start_ui.bat (python server.py)로 실행해야 파일을 열 수 있습니다.");
+  }
+  const res = await fetch("/api/open-ini", { method: "POST" }).then(r => r.json());
+  if (res.ok) setStatus(`📂 열림: ${res.path}`);
+};
+
+document.getElementById("btnSaveIni").onclick = async () => {
+  if (!location.protocol.startsWith("http")) {
+    return setStatus("⚠️ start_ui.bat (python server.py)로 실행해야 저장됩니다.");
+  }
+  const payload = getFormPayload();
+  const res = await fetch("/api/save-ini", { method: "POST", body: JSON.stringify(payload) }).then(r => r.json());
+  if (res.ok) {
+    applyLoadedConfig(res.config);
+    setStatus("💾 omnetpp.ini 설정 저장 완료");
+  }
+};
+
+document.getElementById("btnRunSim").onclick = async e => {
+  if (!location.protocol.startsWith("http")) {
+    return setStatus("⚠️ start_ui.bat (python server.py)로 실행해야 시뮬레이터가 구동됩니다.");
+  }
+  const btn = e.target;
+  btn.disabled = true;
+  const payload = getFormPayload();
+  setStatus(`⏳ WSL Docker에서 [${payload.configName}] (${payload.simTimeLimit}s) 구동 중...`);
+  try {
+    const res = await fetch("/api/run", { method: "POST", body: JSON.stringify(payload) }).then(r => r.json());
+    if (!res.ok) {
+      setStatus(`❌ 실행 오류:\n${res.error}`);
+    } else {
+      routes = res.routes || [];
+      maxSimTime = payload.simTimeLimit;
+      document.getElementById("timeSlider").max = maxSimTime;
+      simTime = Math.min(simTime, maxSimTime);
+      applyLoadedConfig(res.config);
+      setStatus(`✅ 구동 완료! 패킷 경로 ${routes.length}개 로드됨 (0 ~ ${maxSimTime}s)`);
+    }
+  } catch (err) {
+    setStatus(`❌ 서버 통신 실패: ${err.message}`);
+  } finally {
+    btn.disabled = false;
+  }
 };
 
 render();

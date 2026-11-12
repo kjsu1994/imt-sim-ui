@@ -9,7 +9,7 @@
   <header class="topbar">
     <div class="brand">
       <strong>FLoRaSat LEO Simulator</strong>
-      <span class="badge">Walker-Delta 132/12/1 · 550km · 53° · Dijkstra (delay)</span>
+      <span id="topBadge" class="badge">Walker-Delta 132/12/1 · 550km · 53° · Dijkstra (delay)</span>
     </div>
     <div class="controls">
       <button id="btnPlay">▶ Play</button>
@@ -36,6 +36,46 @@
     </section>
 
     <aside class="sidebar">
+      <div class="card sim-runner">
+        <div class="runner-head">
+          <span>⚙️ omnetpp.ini 설정 & 구동</span>
+          <button id="btnOpenIni" type="button" title="윈도우 편집기로 omnetpp.ini 직접 열기">📝 .ini 열기</button>
+        </div>
+        <div class="cfg-grid">
+          <label>시나리오
+            <select id="cfgName">
+              <option value="Dijkstra132">Dijkstra132 (Delay)</option>
+              <option value="Dijkstra132Hop">Dijkstra132Hop (Hop)</option>
+              <option value="Dijkstra132Pair">Dijkstra132Pair (GS0→M11)</option>
+              <option value="Dijkstra132StationsOnly">Dijkstra132StationsOnly</option>
+            </select>
+          </label>
+          <label>라우팅 기준
+            <select id="cfgMetric">
+              <option value="delay">delay (최소지연)</option>
+              <option value="hop">hop (최소홉)</option>
+            </select>
+          </label>
+          <label>구동 시간 (s)
+            <input id="cfgSimTime" type="number" min="10" max="86400" step="10" value="600">
+          </label>
+          <label>전송 주기 (s)
+            <input id="cfgSendInt" type="number" min="0.1" max="60" step="0.5" value="2">
+          </label>
+          <label>최소 앙각 (°)
+            <input id="cfgMinEl" type="number" min="1" max="60" step="1" value="10">
+          </label>
+          <label>위성 고도 (km)
+            <input id="cfgAlt" type="number" min="300" max="2000" step="10" value="550">
+          </label>
+        </div>
+        <div class="runner-actions">
+          <button id="btnSaveIni" type="button">💾 설정만 저장</button>
+          <button id="btnRunSim" type="button" class="btn-primary">🚀 시뮬레이션 구동</button>
+        </div>
+        <div id="runStatus" class="run-status" hidden></div>
+      </div>
+
       <div class="card kpis">
         <div><small>Satellites / ISL</small><strong id="kpiSat">132 / 264</strong></div>
         <div><small>Active GSL (≥10°)</small><strong id="kpiGsl">36</strong></div>

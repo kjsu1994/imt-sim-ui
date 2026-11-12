@@ -3,10 +3,8 @@ const PI = 3.1415926535, TWOPI = 2 * PI, DEG = PI / 180, RAD = 180 / PI;
 const XKMPER = 6378.135, F = 1 / 298.26, GE = 398600.8, J2 = 1.0826158e-3, J3 = -2.53881e-6, J4 = -1.65597e-6;
 const CK2 = J2 / 2, CK4 = -3 * J4 / 8, XJ3 = J3, AE = 1.0, OMEGA_E = 1.00273790934, SEC_DAY = 86400;
 const XKE = Math.sqrt(3600 * GE / (XKMPER ** 3));
-const QOMS2T = ((AE + 120 / XKMPER) - (AE + 78 / XKMPER)) ** 4;
-const S = AE + 78 / XKMPER;
+const PLANES = 12, SATS_PER_PLANE = 11, TOTAL_SATS = 132;
 
-// Epoch: 2020 day 1.5 -> JD
 function julianInit(year, day) {
   const y = year - 1, A = Math.trunc(y / 100), B = 2 - A + Math.trunc(A / 4);
   return Math.trunc(365.25 * y) + Math.trunc(30.6001 * 14) + 1720994.5 + B + day;
@@ -22,24 +20,30 @@ function toGMST(jd) {
 const fmod2p = x => { let m = x % TWOPI; return m < 0 ? m + TWOPI : m; };
 const actan = (sinx, cosx) => cosx === 0 ? (sinx > 0 ? PI / 2 : 1.5 * PI) : (cosx > 0 ? Math.atan(sinx / cosx) : PI + Math.atan(sinx / cosx));
 
-// Precompute SGP4A constants for the 132 satellites (altitude=550km, incl=53deg, ecc=0, argp=0, bstar=0)
-const SATS = [];
-const PLANES = 12, SATS_PER_PLANE = 11, TOTAL_SATS = 132;
-const incl = 53 * DEG, cosio = Math.cos(incl), sinio = Math.sin(incl), theta2 = cosio * cosio;
-const x3thm1 = 3 * theta2 - 1, x1mth2 = 1 - theta2, x7thm1 = 7 * theta2 - 1;
-const a0 = (550 + XKMPER) / XKMPER, n0 = Math.sqrt(398601.2 / ((550 + XKMPER) ** 3)) * 60;
-const a1 = (XKE / n0) ** (2 / 3), d1 = 1.5 * CK2 * x3thm1 / (a1 * a1), a0dp = a1 * (1 - d1 / 3 - d1 * d1 - 134 / 81 * d1 ** 3);
-const p0 = a0dp, q0 = AE + 120 / XKMPER, perigee = (p0 - AE) * XKMPER;
-const s4 = S, qoms24 = QOMS2T, pinvsq = 1 / (a0dp * a0dp), tsi = 1 / (a0dp - s4), eta = 0;
-const coef = qoms24 * (tsi ** 4), c2 = coef * n0 * (a0dp * (1 + 1.5 * eta * eta) + 0.75 * CK2 * tsi / a0dp * x3thm1 * (8 + 3 * eta * eta));
-const c1 = 0, c4 = 2 * n0 * coef * a0dp * (2 * eta * (1 + eta * eta) + CK2 * tsi / (a0dp) * (-3 * x3thm1 * (1 - 2 * eta * eta)));
-const c5 = 2 * coef * a0dp * (1 + 2.75 * eta * eta);
-const theta4 = theta2 * theta2, temp1 = 3 * CK2 * pinvsq * n0, temp2 = temp1 * CK2 * pinvsq, temp3 = 1.25 * CK4 * pinvsq * pinvsq * n0;
-const xmdot = n0 + 0.5 * temp1 * x3thm1 + 0.0625 * temp2 * (13 - 78 * theta2 + 137 * theta4);
-const omgdot = -0.5 * temp1 * (1 - 5 * theta2) + 0.0625 * temp2 * (7 - 114 * theta2 + 395 * theta4) + temp3 * (3 - 36 * theta2 + 49 * theta4);
-const xhdot1 = -temp1 * cosio, xnodot = xhdot1 + (0.5 * temp2 * (4 - 19 * theta2) + 2 * temp3 * (3 - 7 * theta2)) * cosio;
-const xlcof = 0.125 * XJ3 / CK2 * sinio * (3 + 5 * cosio) / (1 + cosio), aycof = 0.25 * XJ3 / CK2 * sinio;
+let ORBIT_CFG = { altitude: 550, inclination: 53, minEl: 10.0 };
+let incl, cosio, sinio, theta2, x3thm1, x1mth2, x7thm1, a0dp, xmdot, omgdot, xnodot, xlcof, aycof;
 
+function updateOrbitConfig(cfg = {}) {
+  if (cfg.altitude) ORBIT_CFG.altitude = parseFloat(cfg.altitude);
+  if (cfg.inclination) ORBIT_CFG.inclination = parseFloat(cfg.inclination);
+  if (cfg.minEl) ORBIT_CFG.minEl = parseFloat(cfg.minEl);
+  incl = ORBIT_CFG.inclination * DEG;
+  cosio = Math.cos(incl); sinio = Math.sin(incl); theta2 = cosio * cosio;
+  x3thm1 = 3 * theta2 - 1; x1mth2 = 1 - theta2; x7thm1 = 7 * theta2 - 1;
+  const n0 = Math.sqrt(398601.2 / ((ORBIT_CFG.altitude + XKMPER) ** 3)) * 60;
+  const a1 = (XKE / n0) ** (2 / 3), d1 = 1.5 * CK2 * x3thm1 / (a1 * a1);
+  a0dp = a1 * (1 - d1 / 3 - d1 * d1 - 134 / 81 * d1 ** 3);
+  const pinvsq = 1 / (a0dp * a0dp), theta4 = theta2 * theta2;
+  const temp1 = 3 * CK2 * pinvsq * n0, temp2 = temp1 * CK2 * pinvsq, temp3 = 1.25 * CK4 * pinvsq * pinvsq * n0;
+  xmdot = n0 + 0.5 * temp1 * x3thm1 + 0.0625 * temp2 * (13 - 78 * theta2 + 137 * theta4);
+  omgdot = -0.5 * temp1 * (1 - 5 * theta2) + 0.0625 * temp2 * (7 - 114 * theta2 + 395 * theta4) + temp3 * (3 - 36 * theta2 + 49 * theta4);
+  xnodot = -temp1 * cosio + (0.5 * temp2 * (4 - 19 * theta2) + 2 * temp3 * (3 - 7 * theta2)) * cosio;
+  xlcof = 0.125 * XJ3 / CK2 * sinio * (3 + 5 * cosio) / (1 + cosio);
+  aycof = 0.25 * XJ3 / CK2 * sinio;
+}
+updateOrbitConfig();
+
+const SATS = [];
 for (let p = 0; p < PLANES; p++) {
   for (let s = 0; s < SATS_PER_PLANE; s++) {
     const idx = s + p * SATS_PER_PLANE;
@@ -65,7 +69,6 @@ function getSatState(sat, tSec) {
   const sinepw = Math.sin(epw), cosepw = Math.cos(epw);
   const ecose = axn * cosepw + ayn * sinepw, esine = axn * sinepw - ayn * cosepw;
   const elsq = axn * axn + ayn * ayn, pl = a * (1 - elsq), r = a * (1 - ecose);
-  const rdot = XKE * Math.sqrt(a) * esine / r, rfdot = XKE * Math.sqrt(pl) / r;
   const cosu = a / r * (cosepw - axn + ayn * esine / (1 + Math.sqrt(1 - elsq)));
   const sinu = a / r * (sinepw - ayn - axn * esine / (1 + Math.sqrt(1 - elsq)));
   const u = actan(sinu, cosu), sin2u = 2 * sinu * cosu, cos2u = 2 * cosu * cosu - 1;
@@ -77,7 +80,6 @@ function getSatState(sat, tSec) {
   const xmx = -sinnok * cosik, xmy = cosnok * cosik;
   const ux = xmx * sinuk + cosnok * cosuk, uy = xmy * sinuk + sinnok * cosuk, uz = sinik * sinuk;
   const x = rk * ux * XKMPER, y = rk * uy * XKMPER, z = rk * uz * XKMPER;
-  // ECI to Geo (cEci::toGeo)
   const theta = actan(y, x), gmst = toGMST(jd);
   let lon = (theta - gmst) % TWOPI;
   if (lon < 0) lon += TWOPI;
@@ -108,7 +110,6 @@ function getElevationDeg(site, satState) {
   return Math.asin(topZ / w) * RAD;
 }
 
-// Stations (0..8 Fixed, 9..12 Mobile)
 const STATIONS = [
   { id: 0, name: "Goldstone (DSN)", lat: 35.42667, lon: -116.89, alt: 0, mobile: false },
   { id: 1, name: "Madrid (DSN)", lat: 40.43139, lon: -4.24806, alt: 0, mobile: false },
@@ -164,4 +165,4 @@ function getStationPos(st, tSec) {
   }
 }
 
-if (typeof module !== "undefined") module.exports = { SATS, STATIONS, getSatState, siteEci, getElevationDeg, getStationPos };
+if (typeof module !== "undefined") module.exports = { SATS, STATIONS, ORBIT_CFG, updateOrbitConfig, getSatState, siteEci, getElevationDeg, getStationPos };
