@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>LEO Satellite Routing Simulator UI (Dijkstra132)</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <strong>FLoRaSat LEO Simulator</strong>
+      <span class="badge">Walker-Delta 132/12/1 · 550km · 53° · Dijkstra (delay)</span>
+    </div>
+    <div class="controls">
+      <button id="btnPlay">▶ Play</button>
+      <button id="btnStepBack" title="-1s">-1s</button>
+      <button id="btnStepFwd" title="+1s">+1s</button>
+      <button id="btnSnap" title="Jump to t=1210s reference">t = 1210s</button>
+      <input id="timeSlider" type="range" min="0" max="5700" step="0.1" value="1210">
+      <span id="timeLabel" class="mono">t = 1210.0 s</span>
+      <select id="speedSel" title="Playback Speed">
+        <option value="1">1x</option>
+        <option value="5">5x</option>
+        <option value="10" selected>10x</option>
+        <option value="30">30x</option>
+        <option value="60">60x</option>
+      </select>
+      <label class="file-btn">📂 Load CSV<input id="csvInput" type="file" accept=".csv" hidden></label>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="map-wrap">
+      <canvas id="mapCanvas" width="2160" height="1080"></canvas>
+      <div id="tooltip" class="tooltip" hidden></div>
+    </section>
+
+    <aside class="sidebar">
+      <div class="card kpis">
+        <div><small>Satellites / ISL</small><strong id="kpiSat">132 / 264</strong></div>
+        <div><small>Active GSL (≥10°)</small><strong id="kpiGsl">36</strong></div>
+        <div><small>Delivered (≤ t)</small><strong id="kpiPkts">5416</strong></div>
+        <div><small>Avg Delay / Hops</small><strong id="kpiDelay">47.6 ms / 3.4</strong></div>
+      </div>
+
+      <div class="card toggles">
+        <label><input type="checkbox" id="chkIsl" checked> ISLs</label>
+        <label><input type="checkbox" id="chkGsl" checked> GSLs</label>
+        <label><input type="checkbox" id="chkFoot" checked> GSL Footprints</label>
+        <label><input type="checkbox" id="chkRoutes" checked> Active Routes</label>
+        <label><input type="checkbox" id="chkLabels" checked> Labels</label>
+      </div>
+
+      <div class="card filters">
+        <select id="srcFilter"><option value="-1">All Ground Stations (GS0–GS8)</option></select>
+        <select id="dstFilter"><option value="-1">All Mobile Terminals (9–12)</option></select>
+      </div>
+
+      <div class="card log-card">
+        <div class="log-head">
+          <span>Recent Routed Packets (30s window)</span>
+          <small id="activeCount">0 active</small>
+        </div>
+        <div class="table-scroll">
+          <table id="routeTable">
+            <thead>
+              <tr><th>Time</th><th>Source → Dest</th><th>Hops</th><th>Delay</th><th>Path</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script src="data/routes_data.js"></script>
+  <script src="orbit.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

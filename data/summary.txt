@@ -1,0 +1,1 @@
+downlink (station->mobile): sent 25356, delivered 25355, noUplink 287, mobile sent 0 | hops 3.41 (max 10) pred 46.7 ms (max 116.7)
