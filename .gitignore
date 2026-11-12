@@ -7,12 +7,16 @@ Desktop.ini
 *.swp
 *~
 
-# Node / Python / Temp
+# Node / Python / PyInstaller / Temp
 node_modules/
 __pycache__/
 *.pyc
 *.log
 *.tmp
+build/
+dist/
+*.spec
+*.exe
 
 # Heavy OMNeT++ raw simulation dumps (if copied into workspace)
 *.sca

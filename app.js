@@ -381,51 +381,47 @@ function applyLoadedConfig(cfg) {
 }
 
 if (location.protocol.startsWith("http")) {
-  fetch("/api/config").then(r => r.json()).then(applyLoadedConfig).catch(() => {});
+  const syncIniFromDisk = () => fetch("/api/config").then(r => r.json()).then(applyLoadedConfig).catch(() => {});
+  syncIniFromDisk();
+  window.addEventListener("focus", syncIniFromDisk);
 }
 
 document.getElementById("btnOpenIni").onclick = async () => {
   if (!location.protocol.startsWith("http")) {
-    return setStatus("⚠️ start_ui.bat (python server.py)로 실행해야 파일을 열 수 있습니다.");
+    return setStatus("⚠️ sim-ui.exe로 실행해야 원본 .ini 파일을 열 수 있습니다.");
   }
   const res = await fetch("/api/open-ini", { method: "POST" }).then(r => r.json());
   if (res.ok) setStatus(`📂 열림: ${res.path}`);
 };
 
 document.getElementById("btnSaveIni").onclick = async () => {
-  if (!location.protocol.startsWith("http")) {
-    return setStatus("⚠️ start_ui.bat (python server.py)로 실행해야 저장됩니다.");
-  }
   const payload = getFormPayload();
-  const res = await fetch("/api/save-ini", { method: "POST", body: JSON.stringify(payload) }).then(r => r.json());
-  if (res.ok) {
-    applyLoadedConfig(res.config);
-    setStatus("💾 omnetpp.ini 설정 저장 완료");
+  applyLoadedConfig(payload);
+  if (!location.protocol.startsWith("http")) {
+    return setStatus("💾 화면에 설정 반영됨 (파일 저장은 sim-ui.exe에서 동작)");
   }
+  const res = await fetch("/api/save-ini", { method: "POST", body: JSON.stringify(payload) }).then(r => r.json());
+  if (res.ok) setStatus(`💾 저장 완료: ${res.config.iniPath}`);
 };
 
 document.getElementById("btnRunSim").onclick = async e => {
-  if (!location.protocol.startsWith("http")) {
-    return setStatus("⚠️ start_ui.bat (python server.py)로 실행해야 시뮬레이터가 구동됩니다.");
-  }
   const btn = e.target;
   btn.disabled = true;
   const payload = getFormPayload();
-  setStatus(`⏳ WSL Docker에서 [${payload.configName}] (${payload.simTimeLimit}s) 구동 중...`);
+  setStatus(`⏳ [${payload.configName}] (${payload.simTimeLimit}s) OMNeT++ 시뮬레이션 실행 중...`);
   try {
+    const t0 = performance.now();
     const res = await fetch("/api/run", { method: "POST", body: JSON.stringify(payload) }).then(r => r.json());
-    if (!res.ok) {
-      setStatus(`❌ 실행 오류:\n${res.error}`);
-    } else {
-      routes = res.routes || [];
-      maxSimTime = payload.simTimeLimit;
-      document.getElementById("timeSlider").max = maxSimTime;
-      simTime = Math.min(simTime, maxSimTime);
-      applyLoadedConfig(res.config);
-      setStatus(`✅ 구동 완료! 패킷 경로 ${routes.length}개 로드됨 (0 ~ ${maxSimTime}s)`);
-    }
+    if (!res.ok) throw new Error(res.error || "Simulation failed");
+    routes = res.routes;
+    maxSimTime = payload.simTimeLimit;
+    document.getElementById("timeSlider").max = maxSimTime;
+    simTime = Math.min(simTime, maxSimTime);
+    applyLoadedConfig(res.config);
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+    setStatus(`✅ 완료! (${elapsed}s 소요 · 패킷 ${routes.length}개 로드됨)`);
   } catch (err) {
-    setStatus(`❌ 서버 통신 실패: ${err.message}`);
+    setStatus(`❌ 실행 오류: ${err.message}`);
   } finally {
     btn.disabled = false;
   }

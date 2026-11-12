@@ -1,9 +1,10 @@
-// LEO Constellation (Walker-Delta 132/12/1) & SGP4A / Mobile Station Propagator
+// LEO Constellation (Walker-Delta 132/12/1) & SGP4A / Mobile Station / Topology Snapshot
 const PI = 3.1415926535, TWOPI = 2 * PI, DEG = PI / 180, RAD = 180 / PI;
 const XKMPER = 6378.135, F = 1 / 298.26, GE = 398600.8, J2 = 1.0826158e-3, J3 = -2.53881e-6, J4 = -1.65597e-6;
 const CK2 = J2 / 2, CK4 = -3 * J4 / 8, XJ3 = J3, AE = 1.0, OMEGA_E = 1.00273790934, SEC_DAY = 86400;
 const XKE = Math.sqrt(3600 * GE / (XKMPER ** 3));
 const PLANES = 12, SATS_PER_PLANE = 11, TOTAL_SATS = 132;
+const LIGHT_DELAY_S_PER_KM = 0.0000033356; // TopologyControlBase.ned: islDelay / groundlinkDelay
 
 function julianInit(year, day) {
   const y = year - 1, A = Math.trunc(y / 100), B = 2 - A + Math.trunc(A / 4);
@@ -164,5 +165,3 @@ function getStationPos(st, tSec) {
     }
   }
 }
-
-if (typeof module !== "undefined") module.exports = { SATS, STATIONS, ORBIT_CFG, updateOrbitConfig, getSatState, siteEci, getElevationDeg, getStationPos };

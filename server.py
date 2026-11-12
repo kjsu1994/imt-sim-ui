@@ -5,17 +5,20 @@ import re
 import shutil
 import string
 import subprocess
+import sys
+import tarfile
 import tempfile
+import threading
 import webbrowser
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 LOCAL_INI = os.path.join(BASE_DIR, "data", "omnetpp.ini")
+IMAGE_NAME = "florasat-sim:local"
+NO_WIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def find_leo_main():
-    # 1. Sibling directory (e.g., ../leo-main)
     candidates = [os.path.abspath(os.path.join(BASE_DIR, "..", "leo-main"))]
-    # 2. Root of any mounted drive C:\ .. Z:\ (e.g., C:\leo-main, O:\leo-main)
     candidates += [f"{d}:\\leo-main" for d in string.ascii_uppercase]
     for path in candidates:
         if os.path.isfile(os.path.join(path, "simulations", "Dijkstra132", "omnetpp.ini")):
@@ -60,61 +63,96 @@ def update_ini_config(cfg):
         txt = re.sub(r"^(\*\.constellationCreator\.altitude\s*=\s*)[0-9.]+", rf"\g<1>{cfg['altitude']}", txt, flags=re.M)
     if "inclination" in cfg:
         txt = re.sub(r"^(\*\.constellationCreator\.inclination\s*=\s*)[0-9.]+", rf"\g<1>{cfg['inclination']}", txt, flags=re.M)
-    txt = re.sub(r'^(\*\.mapDataSource\.graphLogFile\s*=\s*)"[^"]*"', r'\1""', txt, flags=re.M)
 
     open(INI_PATH, "w", encoding="utf-8", newline="\n").write(txt)
     if INI_PATH != LOCAL_INI:
         shutil.copyfile(INI_PATH, LOCAL_INI)
 
 
-def ensure_docker_image():
-    chk = subprocess.run(["wsl", "--cd", "~", "-e", "docker", "image", "inspect", "florasat-sim:local"], capture_output=True)
-    if chk.returncode == 0:
-        return True, ""
-    if not LEO_DIR:
-        return False, "florasat-sim:local 도커 이미지가 없고 leo-main 원본 폴더를 찾을 수 없습니다."
-
-    # Auto-build image on a new PC using leo-main + Dockerfile
-    dockerfile_src = os.path.join(BASE_DIR, "Dockerfile")
-    dockerfile_dst = os.path.join(LEO_DIR, "Dockerfile")
-    shutil.copyfile(dockerfile_src, dockerfile_dst)
-    tar_path = os.path.join(tempfile.gettempdir(), "florasat_build.tar")
-    try:
-        subprocess.run([
-            "tar.exe", "--exclude=simulations/Dijkstra132/results_sample/graph.jsonl",
-            "--exclude=.git", "-cf", tar_path, "-C", LEO_DIR, "."
-        ], check=True)
-        wsl_tar = "/mnt/" + tar_path[0].lower() + tar_path[2:].replace("\\", "/")
-        build = subprocess.run(
-            ["wsl", "--cd", "~", "-e", "bash", "-c", f"docker build -t florasat-sim:local - < '{wsl_tar}'"],
-            capture_output=True, text=True
-        )
-        return build.returncode == 0, (build.stderr or build.stdout)[-1500:]
-    finally:
-        if os.path.exists(dockerfile_dst):
-            os.remove(dockerfile_dst)
-        if os.path.exists(tar_path):
-            os.remove(tar_path)
-
-
 def parse_routes_csv(csv_text):
-    lines = [l.strip() for l in csv_text.splitlines() if l.strip()]
-    data = []
-    for l in lines:
-        r = l.split(",")
+    routes = []
+    for line in csv_text.strip().splitlines()[1:]:
+        if not line:
+            continue
+        r = line.split(",")
         if len(r) < 11 or r[0] == "time" or not r[0][0].isdigit():
             continue
-        src = int(r[2][2:]) if r[2].startswith("GS") else int(r[2].lstrip("T"))
-        data.append([
-            round(float(r[0]), 2), int(r[1]), src, int(r[3]),
-            int(r[6]), round(float(r[9]), 1), [int(x) for x in r[10].split("-") if x]
+        routes.append([
+            float(r[0]),
+            int(r[1]),
+            int(r[2].replace("GS", "")),
+            int(r[3]),
+            int(r[6]),
+            float(r[9]),
+            [int(x) for x in r[10].split("-") if x],
         ])
-    return data
+    return routes
+
+
+def ensure_docker_image():
+    chk = subprocess.run(
+        ["wsl", "--cd", "~", "-e", "docker", "image", "inspect", IMAGE_NAME],
+        capture_output=True, creationflags=NO_WIN
+    )
+    if chk.returncode == 0:
+        return
+    if not LEO_DIR:
+        raise RuntimeError("Docker image missing and leo-main directory was not found.")
+    tmp_tar = os.path.join(tempfile.gettempdir(), "florasat_build.tar")
+    with tarfile.open(tmp_tar, "w", format=tarfile.GNU_FORMAT) as tar:
+        tar.add(os.path.join(BASE_DIR, "Dockerfile"), arcname="Dockerfile")
+        for item in ("src", "simulations"):
+            tar.add(os.path.join(LEO_DIR, item), arcname=item)
+    wsl_tar = "/mnt/" + tmp_tar[0].lower() + tmp_tar[2:].replace("\\", "/")
+    res = subprocess.run(
+        ["wsl", "--cd", "~", "-e", "bash", "-c", f"docker build -t {IMAGE_NAME} - < '{wsl_tar}'"],
+        capture_output=True, text=True, creationflags=NO_WIN
+    )
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr or res.stdout)
+
+
+def run_simulation(config_name="Dijkstra132"):
+    ensure_docker_image()
+    ini_bytes = open(INI_PATH, "rb").read()
+    cmd = (
+        f"docker run --rm -i --entrypoint /bin/bash {IMAGE_NAME} -c "
+        f"'cat > omnetpp.ini && source /root/omnetpp/setenv >/dev/null 2>&1 && "
+        f"source /opt/inet4.5/setenv >/dev/null 2>&1 && "
+        f"opp_run -u Cmdenv -c {config_name} -n ../../src:..:/opt/inet4.5/src -l ../../src/flora omnetpp.ini >/dev/null 2>&1 && "
+        f"cat results/routes.csv'"
+    )
+    proc = subprocess.run(
+        ["wsl", "--cd", "~", "-e", "bash", "-c", cmd],
+        input=ini_bytes, capture_output=True, timeout=600, creationflags=NO_WIN
+    )
+    csv_text = proc.stdout.decode("utf-8", errors="replace")
+    if proc.returncode != 0 or "time,route" not in csv_text:
+        err = proc.stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(err or csv_text or "Simulator failed")
+
+    idx = csv_text.index("time,route")
+    clean_csv = csv_text[idx:]
+    open(os.path.join(BASE_DIR, "data", "routes.csv"), "w", encoding="utf-8", newline="\n").write(clean_csv)
+
+    if LEO_DIR:
+        leo_res_dir = os.path.join(LEO_DIR, "simulations", "Dijkstra132", "results")
+        os.makedirs(leo_res_dir, exist_ok=True)
+        open(os.path.join(leo_res_dir, "routes.csv"), "w", encoding="utf-8", newline="\n").write(clean_csv)
+
+    routes = parse_routes_csv(clean_csv)
+    open(os.path.join(BASE_DIR, "data", "routes_data.js"), "w", encoding="utf-8").write(
+        "window.ROUTES=" + json.dumps(routes, separators=(",", ":")) + ";"
+    )
+    return routes
 
 
 class SimHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=BASE_DIR, **kwargs)
+
+    def log_message(self, format, *args):
+        pass
 
     def send_json(self, payload, status=200):
         body = json.dumps(payload).encode("utf-8")
@@ -142,56 +180,28 @@ class SimHandler(http.server.SimpleHTTPRequestHandler):
             return self.send_json({"ok": True, "config": read_ini_config()})
 
         if self.path == "/api/run":
-            update_ini_config(body)
-            ok, err = ensure_docker_image()
-            if not ok:
-                return self.send_json({"ok": False, "error": err}, status=500)
-
-            cfg = read_ini_config()
-            config_name = body.get("configName", "Dijkstra132")
-            sim_limit = cfg["simTimeLimit"]
-
-            # Pipe omnetpp.ini via stdin into stateless container and read routes.csv via stdout
-            sim_cmd = (
-                "docker run --rm -i --entrypoint /bin/bash florasat-sim:local -c '"
-                "cat > omnetpp.ini && "
-                "source /root/omnetpp/setenv >/dev/null 2>&1 && source /opt/inet4.5/setenv >/dev/null 2>&1 && "
-                "mkdir -p results && rm -f results/routes.csv && "
-                f"opp_run -u Cmdenv -c {config_name} -n ../../src:..:/opt/inet4.5/src "
-                "-l ../../src/flora -l /opt/inet4.5/src/INET "
-                f"--sim-time-limit={sim_limit}s omnetpp.ini >/dev/null 2>&1 && "
-                "cat results/routes.csv'"
-            )
-            proc = subprocess.run(
-                ["wsl", "--cd", "~", "-e", "bash", "-c", sim_cmd],
-                input=open(INI_PATH, "rb").read(),
-                capture_output=True
-            )
-            if proc.returncode != 0:
-                err_txt = (proc.stderr or proc.stdout).decode("utf-8", errors="replace")[-1500:]
-                return self.send_json({"ok": False, "error": err_txt}, status=500)
-
-            csv_text = proc.stdout.decode("utf-8", errors="replace")
-            open(os.path.join(BASE_DIR, "data", "routes.csv"), "w", encoding="utf-8", newline="\n").write(csv_text)
-            if LEO_DIR:
-                leo_res_dir = os.path.join(LEO_DIR, "simulations", "Dijkstra132", "results")
-                os.makedirs(leo_res_dir, exist_ok=True)
-                open(os.path.join(leo_res_dir, "routes.csv"), "w", encoding="utf-8", newline="\n").write(csv_text)
-
-            routes = parse_routes_csv(csv_text)
-            open(os.path.join(BASE_DIR, "data", "routes_data.js"), "w", encoding="utf-8").write(
-                "window.ROUTES=" + json.dumps(routes, separators=(",", ":")) + ";"
-            )
-            return self.send_json({"ok": True, "config": cfg, "routes": routes})
+            try:
+                update_ini_config(body)
+                routes = run_simulation(body.get("configName", "Dijkstra132"))
+                return self.send_json({"ok": True, "routes": routes, "config": read_ini_config()})
+            except Exception as e:
+                return self.send_json({"ok": False, "error": str(e)}, status=500)
 
         self.send_error(404)
 
 
 if __name__ == "__main__":
     port = 8090
-    url = f"http://localhost:{port}"
-    print(f"LEO Simulator Web UI: {url}")
-    print(f"Auto-detected INI   : {INI_PATH}")
-    if not os.environ.get("NO_BROWSER"):
+    url = f"http://127.0.0.1:{port}"
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), SimHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    try:
+        import webview
+        webview.create_window("FLoRaSat LEO Simulator", url, width=1520, height=900)
+        webview.start()
+    except ImportError:
         webbrowser.open(url)
-    http.server.ThreadingHTTPServer(("127.0.0.1", port), SimHandler).serve_forever()
+        input(f"Running at {url} (Press Enter to quit)...\n")
+    finally:
+        srv.shutdown()
