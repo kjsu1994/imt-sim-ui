@@ -3,29 +3,45 @@ import json
 import os
 import re
 import shutil
+import string
 import subprocess
+import tempfile
 import webbrowser
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LEO_INI = r"O:\leo-main\simulations\Dijkstra132\omnetpp.ini" # ini 파일 저장위치
 LOCAL_INI = os.path.join(BASE_DIR, "data", "omnetpp.ini")
-INI_PATH = LEO_INI if os.path.exists(LEO_INI) else LOCAL_INI
+
+
+def find_leo_main():
+    # 1. Sibling directory (e.g., ../leo-main)
+    candidates = [os.path.abspath(os.path.join(BASE_DIR, "..", "leo-main"))]
+    # 2. Root of any mounted drive C:\ .. Z:\ (e.g., C:\leo-main, O:\leo-main)
+    candidates += [f"{d}:\\leo-main" for d in string.ascii_uppercase]
+    for path in candidates:
+        if os.path.isfile(os.path.join(path, "simulations", "Dijkstra132", "omnetpp.ini")):
+            return path
+    return None
+
+
+LEO_DIR = find_leo_main()
+INI_PATH = os.path.join(LEO_DIR, "simulations", "Dijkstra132", "omnetpp.ini") if LEO_DIR else LOCAL_INI
 
 
 def read_ini_config():
     txt = open(INI_PATH, "r", encoding="utf-8").read()
-    def find_val(pattern, default):
-        m = re.search(pattern, txt, re.M)
+    def val(pat, default):
+        m = re.search(pat, txt, re.M)
         return m.group(1) if m else default
 
     return {
         "iniPath": INI_PATH,
-        "simTimeLimit": float(find_val(r"^sim-time-limit\s*=\s*([0-9.]+)", "600")),
-        "sendInterval": float(find_val(r"^\*\.station\[\*\]\.traffic\.sendInterval\s*=\s*([0-9.]+)", "2")),
-        "minimumElevation": float(find_val(r"^\*\.topologyControl\.minimumElevation\s*=\s*([0-9.]+)", "10.0")),
-        "metric": find_val(r'^\*\.satellite\[\*\]\.net\.routing\.metric\s*=\s*"(\w+)"', "delay"),
-        "altitude": float(find_val(r"^\*\.constellationCreator\.altitude\s*=\s*([0-9.]+)", "550")),
-        "inclination": float(find_val(r"^\*\.constellationCreator\.inclination\s*=\s*([0-9.]+)", "53")),
+        "leoDir": LEO_DIR,
+        "simTimeLimit": float(val(r"^sim-time-limit\s*=\s*([0-9.]+)", "600")),
+        "sendInterval": float(val(r"^\*\.station\[\*\]\.traffic\.sendInterval\s*=\s*([0-9.]+)", "2")),
+        "minimumElevation": float(val(r"^\*\.topologyControl\.minimumElevation\s*=\s*([0-9.]+)", "10.0")),
+        "metric": val(r'^\*\.satellite\[\*\]\.net\.routing\.metric\s*=\s*"(\w+)"', "delay"),
+        "altitude": float(val(r"^\*\.constellationCreator\.altitude\s*=\s*([0-9.]+)", "550")),
+        "inclination": float(val(r"^\*\.constellationCreator\.inclination\s*=\s*([0-9.]+)", "53")),
     }
 
 
@@ -51,22 +67,47 @@ def update_ini_config(cfg):
         shutil.copyfile(INI_PATH, LOCAL_INI)
 
 
+def ensure_docker_image():
+    chk = subprocess.run(["wsl", "--cd", "~", "-e", "docker", "image", "inspect", "florasat-sim:local"], capture_output=True)
+    if chk.returncode == 0:
+        return True, ""
+    if not LEO_DIR:
+        return False, "florasat-sim:local 도커 이미지가 없고 leo-main 원본 폴더를 찾을 수 없습니다."
+
+    # Auto-build image on a new PC using leo-main + Dockerfile
+    dockerfile_src = os.path.join(BASE_DIR, "Dockerfile")
+    dockerfile_dst = os.path.join(LEO_DIR, "Dockerfile")
+    shutil.copyfile(dockerfile_src, dockerfile_dst)
+    tar_path = os.path.join(tempfile.gettempdir(), "florasat_build.tar")
+    try:
+        subprocess.run([
+            "tar.exe", "--exclude=simulations/Dijkstra132/results_sample/graph.jsonl",
+            "--exclude=.git", "-cf", tar_path, "-C", LEO_DIR, "."
+        ], check=True)
+        wsl_tar = "/mnt/" + tar_path[0].lower() + tar_path[2:].replace("\\", "/")
+        build = subprocess.run(
+            ["wsl", "--cd", "~", "-e", "bash", "-c", f"docker build -t florasat-sim:local - < '{wsl_tar}'"],
+            capture_output=True, text=True
+        )
+        return build.returncode == 0, (build.stderr or build.stdout)[-1500:]
+    finally:
+        if os.path.exists(dockerfile_dst):
+            os.remove(dockerfile_dst)
+        if os.path.exists(tar_path):
+            os.remove(tar_path)
+
+
 def parse_routes_csv(csv_text):
-    lines = [l.strip() for l in csv_text.splitlines() if l.strip()][1:]
+    lines = [l.strip() for l in csv_text.splitlines() if l.strip()]
     data = []
     for l in lines:
         r = l.split(",")
-        if len(r) < 11:
+        if len(r) < 11 or r[0] == "time" or not r[0][0].isdigit():
             continue
         src = int(r[2][2:]) if r[2].startswith("GS") else int(r[2].lstrip("T"))
         data.append([
-            round(float(r[0]), 2),
-            int(r[1]),
-            src,
-            int(r[3]),
-            int(r[6]),
-            round(float(r[9]), 1),
-            [int(x) for x in r[10].split("-") if x]
+            round(float(r[0]), 2), int(r[1]), src, int(r[3]),
+            int(r[6]), round(float(r[9]), 1), [int(x) for x in r[10].split("-") if x]
         ])
     return data
 
@@ -101,54 +142,47 @@ class SimHandler(http.server.SimpleHTTPRequestHandler):
             return self.send_json({"ok": True, "config": read_ini_config()})
 
         if self.path == "/api/run":
-            if body.get("updateIni", True):
-                update_ini_config(body)
+            update_ini_config(body)
+            ok, err = ensure_docker_image()
+            if not ok:
+                return self.send_json({"ok": False, "error": err}, status=500)
+
             cfg = read_ini_config()
             config_name = body.get("configName", "Dijkstra132")
             sim_limit = cfg["simTimeLimit"]
 
-            # Sync current omnetpp.ini into WSL ~/florasat/simulations/Dijkstra132/omnetpp.ini
-            ini_bytes = open(INI_PATH, "rb").read()
-            subprocess.run(
-                ["wsl", "--cd", "~", "-e", "bash", "-c", "cat > ~/florasat/simulations/Dijkstra132/omnetpp.ini"],
-                input=ini_bytes, check=True
-            )
-
-            # Run actual OMNeT++ simulation inside WSL Docker container
+            # Pipe omnetpp.ini via stdin into stateless container and read routes.csv via stdout
             sim_cmd = (
-                "docker run --rm --entrypoint /bin/bash "
-                "-v ~/florasat/simulations/Dijkstra132:/opt/florasat/simulations/Dijkstra132 "
-                "florasat-sim:local -c '"
-                "source /root/omnetpp/setenv -q && source /opt/inet4.5/setenv -q && "
-                "mkdir -p results && rm -f results/routes.csv results/graph.jsonl && "
+                "docker run --rm -i --entrypoint /bin/bash florasat-sim:local -c '"
+                "cat > omnetpp.ini && "
+                "source /root/omnetpp/setenv >/dev/null 2>&1 && source /opt/inet4.5/setenv >/dev/null 2>&1 && "
+                "mkdir -p results && rm -f results/routes.csv && "
                 f"opp_run -u Cmdenv -c {config_name} -n ../../src:..:/opt/inet4.5/src "
                 "-l ../../src/flora -l /opt/inet4.5/src/INET "
-                f"--sim-time-limit={sim_limit}s omnetpp.ini'"
+                f"--sim-time-limit={sim_limit}s omnetpp.ini >/dev/null 2>&1 && "
+                "cat results/routes.csv'"
             )
             proc = subprocess.run(
                 ["wsl", "--cd", "~", "-e", "bash", "-c", sim_cmd],
-                capture_output=True, text=True
+                input=open(INI_PATH, "rb").read(),
+                capture_output=True
             )
             if proc.returncode != 0:
-                return self.send_json({"ok": False, "error": (proc.stderr or proc.stdout)[-1500:]}, status=500)
+                err_txt = (proc.stderr or proc.stdout).decode("utf-8", errors="replace")[-1500:]
+                return self.send_json({"ok": False, "error": err_txt}, status=500)
 
-            # Fetch generated routes.csv from WSL
-            csv_proc = subprocess.run(
-                ["wsl", "--cd", "~", "-e", "bash", "-c", "cat ~/florasat/simulations/Dijkstra132/results/routes.csv"],
-                capture_output=True, text=True, check=True
-            )
-            csv_text = csv_proc.stdout
+            csv_text = proc.stdout.decode("utf-8", errors="replace")
             open(os.path.join(BASE_DIR, "data", "routes.csv"), "w", encoding="utf-8", newline="\n").write(csv_text)
+            if LEO_DIR:
+                leo_res_dir = os.path.join(LEO_DIR, "simulations", "Dijkstra132", "results")
+                os.makedirs(leo_res_dir, exist_ok=True)
+                open(os.path.join(leo_res_dir, "routes.csv"), "w", encoding="utf-8", newline="\n").write(csv_text)
+
             routes = parse_routes_csv(csv_text)
             open(os.path.join(BASE_DIR, "data", "routes_data.js"), "w", encoding="utf-8").write(
                 "window.ROUTES=" + json.dumps(routes, separators=(",", ":")) + ";"
             )
-            return self.send_json({
-                "ok": True,
-                "config": cfg,
-                "routes": routes,
-                "log": (proc.stdout or "")[-800:]
-            })
+            return self.send_json({"ok": True, "config": cfg, "routes": routes})
 
         self.send_error(404)
 
@@ -156,7 +190,8 @@ class SimHandler(http.server.SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     port = 8090
     url = f"http://localhost:{port}"
-    print(f"LEO Simulator Web UI running at {url}")
-    print(f"Target INI: {INI_PATH}")
-    webbrowser.open(url)
+    print(f"LEO Simulator Web UI: {url}")
+    print(f"Auto-detected INI   : {INI_PATH}")
+    if not os.environ.get("NO_BROWSER"):
+        webbrowser.open(url)
     http.server.ThreadingHTTPServer(("127.0.0.1", port), SimHandler).serve_forever()
