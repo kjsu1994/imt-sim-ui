@@ -9,6 +9,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import urllib.parse
 import webbrowser
 
 BASE_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
@@ -30,43 +31,215 @@ LEO_DIR = find_leo_main()
 INI_PATH = os.path.join(LEO_DIR, "simulations", "Dijkstra132", "omnetpp.ini") if LEO_DIR else LOCAL_INI
 
 
-def read_ini_config():
-    txt = open(INI_PATH, "r", encoding="utf-8").read()
-    def val(pat, default):
-        m = re.search(pat, txt, re.M)
-        return m.group(1) if m else default
+def _strip_comment(raw):
+    in_q = False
+    out = []
+    for ch in raw:
+        if ch == '"':
+            in_q = not in_q
+        elif ch == "#" and not in_q:
+            break
+        out.append(ch)
+    return "".join(out).strip()
+
+
+def _unquote(val):
+    v = val.strip()
+    return v[1:-1] if len(v) >= 2 and v[0] == '"' and v[-1] == '"' else v
+
+
+def _num(val, default=0.0):
+    m = re.match(r"[-+]?[0-9]*\.?[0-9]+", str(val).strip())
+    return float(m.group(0)) if m else default
+
+
+def _time_sec(val, default=0.0):
+    m = re.match(r"^\s*([-+]?[0-9]*\.?[0-9]+)\s*(ms|s|min|h|d)?", str(val).strip())
+    if not m:
+        return default
+    scale = {None: 1.0, "ms": 0.001, "s": 1.0, "min": 60.0, "h": 3600.0, "d": 86400.0}.get(m.group(2), 1.0)
+    return float(m.group(1)) * scale
+
+
+def _parse_ini_tree(entry_path):
+    sections = {"General": []}
+    extends = {}
+    configs = []
+    visited = set()
+
+    def walk(path, cur_sec, is_root):
+        norm = os.path.normpath(path)
+        if norm in visited or not os.path.isfile(norm):
+            return cur_sec
+        visited.add(norm)
+        for raw_line in open(norm, "r", encoding="utf-8"):
+            line = _strip_comment(raw_line)
+            if not line:
+                continue
+            m_sec = re.match(r"^\[(?:Config\s+)?([^\]]+)\]$", line)
+            if m_sec:
+                name = m_sec.group(1).strip()
+                cur_sec = "General" if name == "General" else name
+                sections.setdefault(cur_sec, [])
+                if is_root and cur_sec != "General" and not any(c["name"] == cur_sec for c in configs):
+                    configs.append({"name": cur_sec, "description": ""})
+                continue
+            m_inc = re.match(r"^include\s+(.+)$", line)
+            if m_inc:
+                rel = _unquote(m_inc.group(1))
+                cand = os.path.join(os.path.dirname(norm), rel)
+                if not os.path.isfile(cand):
+                    cand = os.path.join(BASE_DIR, "data", os.path.basename(rel))
+                cur_sec = walk(cand, cur_sec, False)
+                continue
+            if "=" not in line:
+                continue
+            k, v = [p.strip() for p in line.split("=", 1)]
+            if k == "extends":
+                extends[cur_sec] = [x.strip() for x in v.split(",") if x.strip()]
+            elif k == "description" and is_root:
+                cfg_obj = next((c for c in configs if c["name"] == cur_sec), None)
+                if cfg_obj is not None:
+                    cfg_obj["description"] = _unquote(v)
+            else:
+                sections.setdefault(cur_sec, []).append((k, v))
+        return cur_sec
+
+    walk(entry_path, "General", True)
+    return configs, sections, extends
+
+
+def _resolve_chain(cfg_name, extends):
+    seen, chain = set(), ["General"]
+    def visit(name):
+        if name in seen or name == "General":
+            return
+        seen.add(name)
+        for p in extends.get(name, []):
+            visit(p)
+        chain.append(name)
+    visit(cfg_name)
+    return chain
+
+
+def _parse_stations(items):
+    st_map = {}
+    for k, v in items:
+        m = re.match(r"^\*\.station\[(\d+)(?:\.\.(\d+))?\]\.(.+)$", k)
+        if not m:
+            continue
+        lo = int(m.group(1))
+        hi = int(m.group(2)) if m.group(2) else lo
+        prop = m.group(3)
+        val = _unquote(v)
+        for idx in range(lo, hi + 1):
+            st = st_map.setdefault(idx, {"id": idx, "name": f"Station {idx}", "lat": 0.0, "lon": 0.0, "alt": 0.0, "mobile": False})
+            if prop == "label":
+                st["name"] = val
+            elif prop == "nodeType":
+                st["mobile"] = (val == "mobile")
+            elif prop == "mobility.latitude":
+                st["lat"] = float(val)
+            elif prop == "mobility.longitude":
+                st["lon"] = float(val)
+            elif prop == "mobility.altitudeKm":
+                st["alt"] = _num(val)
+            elif prop == "mobility.speed":
+                st["speed"] = _num(val)
+            elif prop == "mobility.routeStart":
+                st["start"] = _num(val)
+            elif prop == "mobility.route":
+                pts = []
+                for pair in val.split():
+                    if "," in pair:
+                        a, b = pair.split(",", 1)
+                        pts.append([float(a), float(b)])
+                if pts:
+                    st["route"] = pts
+                    st["lat"], st["lon"] = pts[0][0], pts[0][1]
+    return [st_map[i] for i in sorted(st_map)]
+
+
+def _parse_terminals(items, limit):
+    if limit <= 0:
+        return []
+    t_map = {}
+    for k, v in items:
+        m = re.match(r"^\*\.terminal\[(\d+)\]\.mob\.(centerLatitude|centerLongitude)$", k)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        if idx >= limit:
+            continue
+        t = t_map.setdefault(idx, {"id": idx, "name": f"T{idx}", "lat": 0.0, "lon": 0.0, "alt": 0.0})
+        if m.group(2) == "centerLatitude":
+            t["lat"] = _num(v)
+        else:
+            t["lon"] = _num(v)
+    return [t_map[i] for i in sorted(t_map)]
+
+
+def read_ini_config(config_name=None):
+    configs, sections, extends = _parse_ini_tree(INI_PATH)
+    names = [c["name"] for c in configs]
+    active = config_name if config_name in names else (names[0] if names else "Dijkstra132")
+    chain = _resolve_chain(active, extends)
+
+    flat = {}
+    items = []
+    resolved = {}
+    for sec in chain:
+        for k, v in sections.get(sec, []):
+            flat[k] = _unquote(v)
+            items.append((k, v))
+            if k in resolved:
+                del resolved[k]
+            resolved[k] = {"k": k, "v": v, "sec": sec}
+
+    def get_num(keys, default, conv=_num):
+        for k in keys:
+            if k in flat:
+                return conv(flat[k], default)
+        return default
+
+    def get_str(keys, default):
+        for k in keys:
+            if k in flat:
+                return flat[k]
+        return default
+
+    num_terminals = int(get_num(["**.numTerminals", "*.numTerminals"], 0))
+    desc = next((c["description"] for c in configs if c["name"] == active), "")
 
     return {
         "iniPath": INI_PATH,
+        "leoFound": bool(LEO_DIR),
         "leoDir": LEO_DIR,
-        "simTimeLimit": float(val(r"^sim-time-limit\s*=\s*([0-9.]+)", "600")),
-        "sendInterval": float(val(r"^\*\.station\[\*\]\.traffic\.sendInterval\s*=\s*([0-9.]+)", "2")),
-        "minimumElevation": float(val(r"^\*\.topologyControl\.minimumElevation\s*=\s*([0-9.]+)", "10.0")),
-        "metric": val(r'^\*\.satellite\[\*\]\.net\.routing\.metric\s*=\s*"(\w+)"', "delay"),
-        "altitude": float(val(r"^\*\.constellationCreator\.altitude\s*=\s*([0-9.]+)", "550")),
-        "inclination": float(val(r"^\*\.constellationCreator\.inclination\s*=\s*([0-9.]+)", "53")),
+        "activeConfig": active,
+        "description": desc,
+        "extends": extends.get(active, []),
+        "chain": chain,
+        "configs": [{**c, "extends": extends.get(c["name"], [])} for c in configs],
+        "ownEntries": [{"k": k, "v": v} for k, v in sections.get(active, [])],
+        "effectiveEntries": list(resolved.values()),
+        "simTimeLimit": get_num(["sim-time-limit"], 600.0, _time_sec),
+        "minimumElevation": get_num(["*.topologyControl.minimumElevation"], 10.0),
+        "metric": get_str(["*.satellite[*].net.routing.metric"], "delay"),
+        "routingType": get_str(["*.satellite[*].net.routingType"], "Sat_Net_DijkstraRouting"),
+        "altitude": get_num(["*.constellationCreator.altitude"], 550.0),
+        "inclination": get_num(["*.constellationCreator.inclination"], 53.0),
+        "numSatellites": int(get_num(["*.numSatellites"], 132)),
+        "planes": int(get_num(["*.**.planeCount", "*.constellationCreator.planeCount"], 12)),
+        "phasing": int(get_num(["*.**.interPlaneSpacing", "*.constellationCreator.interPlaneSpacing"], 1)),
+        "raanSpread": get_num(["*.constellationCreator.raanSpread"], 360.0),
+        "baseYear": int(get_num(["*.constellationCreator.baseYear"], 20)),
+        "baseDay": get_num(["*.constellationCreator.baseDay"], 1.5),
+        "maxRoutes": int(get_num(["*.mapDataSource.maxRoutes"], 8)),
+        "routeLifetime": get_num(["*.mapDataSource.routeLifetime"], 30.0, _time_sec),
+        "numTerminals": num_terminals,
+        "stations": _parse_stations(items),
+        "terminals": _parse_terminals(items, num_terminals),
     }
-
-
-def update_ini_config(cfg):
-    txt = open(INI_PATH, "r", encoding="utf-8").read()
-    if "simTimeLimit" in cfg:
-        txt = re.sub(r"^(sim-time-limit\s*=\s*)[0-9.]+s", rf"\g<1>{cfg['simTimeLimit']}s", txt, flags=re.M)
-    if "sendInterval" in cfg:
-        txt = re.sub(r"^(\*\.station\[\*\]\.traffic\.sendInterval\s*=\s*)[0-9.]+s", rf"\g<1>{cfg['sendInterval']}s", txt, flags=re.M)
-    if "minimumElevation" in cfg:
-        txt = re.sub(r"^(\*\.topologyControl\.minimumElevation\s*=\s*)[0-9.]+", rf"\g<1>{cfg['minimumElevation']}", txt, flags=re.M)
-        txt = re.sub(r"^(\*\.station\[\*\]\.\*\*\.minimumElevation\s*=\s*)[0-9.]+", rf"\g<1>{cfg['minimumElevation']}", txt, flags=re.M)
-    if "metric" in cfg:
-        txt = re.sub(r'^(\*\.satellite\[\*\]\.net\.routing\.metric\s*=\s*)"\w+"', rf'\g<1>"{cfg["metric"]}"', txt, flags=re.M)
-    if "altitude" in cfg:
-        txt = re.sub(r"^(\*\.constellationCreator\.altitude\s*=\s*)[0-9.]+", rf"\g<1>{cfg['altitude']}", txt, flags=re.M)
-    if "inclination" in cfg:
-        txt = re.sub(r"^(\*\.constellationCreator\.inclination\s*=\s*)[0-9.]+", rf"\g<1>{cfg['inclination']}", txt, flags=re.M)
-
-    open(INI_PATH, "w", encoding="utf-8", newline="\n").write(txt)
-    if INI_PATH != LOCAL_INI:
-        shutil.copyfile(INI_PATH, LOCAL_INI)
 
 
 def parse_routes_csv(csv_text):
@@ -77,15 +250,18 @@ def parse_routes_csv(csv_text):
         r = line.split(",")
         if len(r) < 11 or r[0] == "time" or not r[0][0].isdigit():
             continue
-        routes.append([
+        entry = [
             float(r[0]),
             int(r[1]),
-            int(r[2].replace("GS", "")),
+            int(r[2].lstrip("GST")),
             int(r[3]),
             int(r[6]),
             float(r[9]),
             [int(x) for x in r[10].split("-") if x],
-        ])
+        ]
+        if r[2].startswith("T"):
+            entry.append(1)
+        routes.append(entry)
     return routes
 
 
@@ -163,8 +339,11 @@ class SimHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/api/config":
-            return self.send_json(read_ini_config())
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/config":
+            qs = urllib.parse.parse_qs(parsed.query)
+            cfg_name = qs.get("config", [None])[0]
+            return self.send_json(read_ini_config(cfg_name))
         return super().do_GET()
 
     def do_POST(self):
@@ -175,15 +354,11 @@ class SimHandler(http.server.SimpleHTTPRequestHandler):
             os.startfile(INI_PATH)
             return self.send_json({"ok": True, "path": INI_PATH})
 
-        if self.path == "/api/save-ini":
-            update_ini_config(body)
-            return self.send_json({"ok": True, "config": read_ini_config()})
-
         if self.path == "/api/run":
             try:
-                update_ini_config(body)
-                routes = run_simulation(body.get("configName", "Dijkstra132"))
-                return self.send_json({"ok": True, "routes": routes, "config": read_ini_config()})
+                cfg_name = body.get("configName") or read_ini_config().get("activeConfig", "Dijkstra132")
+                routes = run_simulation(cfg_name)
+                return self.send_json({"ok": True, "routes": routes, "config": read_ini_config(cfg_name)})
             except Exception as e:
                 return self.send_json({"ok": False, "error": str(e)}, status=500)
 

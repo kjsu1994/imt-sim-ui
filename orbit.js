@@ -1,16 +1,13 @@
-// LEO Constellation (Walker-Delta 132/12/1) & SGP4A / Mobile Station / Topology Snapshot
+// Dynamic LEO Constellation (Walker-Delta) & SGP4A / Station / Terminal Geometry
 const PI = 3.1415926535, TWOPI = 2 * PI, DEG = PI / 180, RAD = 180 / PI;
 const XKMPER = 6378.135, F = 1 / 298.26, GE = 398600.8, J2 = 1.0826158e-3, J3 = -2.53881e-6, J4 = -1.65597e-6;
-const CK2 = J2 / 2, CK4 = -3 * J4 / 8, XJ3 = J3, AE = 1.0, OMEGA_E = 1.00273790934, SEC_DAY = 86400;
+const CK2 = J2 / 2, CK4 = -3 * J4 / 8, XJ3 = J3, OMEGA_E = 1.00273790934, SEC_DAY = 86400;
 const XKE = Math.sqrt(3600 * GE / (XKMPER ** 3));
-const PLANES = 12, SATS_PER_PLANE = 11, TOTAL_SATS = 132;
-const LIGHT_DELAY_S_PER_KM = 0.0000033356; // TopologyControlBase.ned: islDelay / groundlinkDelay
 
 function julianInit(year, day) {
   const y = year - 1, A = Math.trunc(y / 100), B = 2 - A + Math.trunc(A / 4);
   return Math.trunc(365.25 * y) + Math.trunc(30.6001 * 14) + 1720994.5 + B + day;
 }
-const JD_BASE = julianInit(2020, 1.5);
 
 function toGMST(jd) {
   const UT = (jd + 0.5) % 1, TU = (jd - 2451545.0 - UT) / 36525.0;
@@ -21,13 +18,44 @@ function toGMST(jd) {
 const fmod2p = x => { let m = x % TWOPI; return m < 0 ? m + TWOPI : m; };
 const actan = (sinx, cosx) => cosx === 0 ? (sinx > 0 ? PI / 2 : 1.5 * PI) : (cosx > 0 ? Math.atan(sinx / cosx) : PI + Math.atan(sinx / cosx));
 
-let ORBIT_CFG = { altitude: 550, inclination: 53, minEl: 10.0 };
+let ORBIT_CFG = {
+  altitude: 550, inclination: 53, minEl: 10.0,
+  numSatellites: 132, planes: 12, phasing: 1, raanSpread: 360,
+  baseYear: 20, baseDay: 1.5, routingType: "Sat_Net_DijkstraRouting",
+  metric: "delay", maxRoutes: 8, routeLifetime: 30
+};
+let PLANES = 12, SATS_PER_PLANE = 11, TOTAL_SATS = 132, JD_BASE = julianInit(2020, 1.5);
 let incl, cosio, sinio, theta2, x3thm1, x1mth2, x7thm1, a0dp, xmdot, omgdot, xnodot, xlcof, aycof;
+let SATS = [], STATIONS = [], TERMINALS = [];
+
+function rebuildSats() {
+  PLANES = Math.max(1, ORBIT_CFG.planes);
+  TOTAL_SATS = Math.max(1, ORBIT_CFG.numSatellites);
+  SATS_PER_PLANE = Math.max(1, Math.floor(TOTAL_SATS / PLANES));
+  const raanDelta = ORBIT_CFG.raanSpread / PLANES;
+  const phaseDiff = 360 / SATS_PER_PLANE;
+  const phaseOff = (360 * ORBIT_CFG.phasing) / TOTAL_SATS;
+  SATS = [];
+  for (let p = 0; p < PLANES; p++) {
+    const raan = (p * raanDelta) * DEG;
+    for (let s = 0; s < SATS_PER_PLANE; s++) {
+      const idx = s + p * SATS_PER_PLANE;
+      const ma = ((p * phaseOff + s * phaseDiff) % 360) * DEG;
+      SATS.push({ idx, plane: p, satInPlane: s, raan, ma });
+    }
+  }
+}
 
 function updateOrbitConfig(cfg = {}) {
-  if (cfg.altitude) ORBIT_CFG.altitude = parseFloat(cfg.altitude);
-  if (cfg.inclination) ORBIT_CFG.inclination = parseFloat(cfg.inclination);
-  if (cfg.minEl) ORBIT_CFG.minEl = parseFloat(cfg.minEl);
+  const keys = ["altitude", "inclination", "minEl", "numSatellites", "planes", "phasing", "raanSpread", "baseYear", "baseDay", "maxRoutes", "routeLifetime"];
+  keys.forEach(k => { if (cfg[k] !== undefined && cfg[k] !== null) ORBIT_CFG[k] = parseFloat(cfg[k]); });
+  if (cfg.routingType) ORBIT_CFG.routingType = cfg.routingType;
+  if (cfg.metric) ORBIT_CFG.metric = cfg.metric;
+  if (Array.isArray(cfg.stations) && cfg.stations.length) initStations(cfg.stations);
+  if (Array.isArray(cfg.terminals)) TERMINALS = cfg.terminals;
+
+  const fullYear = ORBIT_CFG.baseYear < 57 ? ORBIT_CFG.baseYear + 2000 : ORBIT_CFG.baseYear + 1900;
+  JD_BASE = julianInit(fullYear, ORBIT_CFG.baseDay);
   incl = ORBIT_CFG.inclination * DEG;
   cosio = Math.cos(incl); sinio = Math.sin(incl); theta2 = cosio * cosio;
   x3thm1 = 3 * theta2 - 1; x1mth2 = 1 - theta2; x7thm1 = 7 * theta2 - 1;
@@ -41,17 +69,7 @@ function updateOrbitConfig(cfg = {}) {
   xnodot = -temp1 * cosio + (0.5 * temp2 * (4 - 19 * theta2) + 2 * temp3 * (3 - 7 * theta2)) * cosio;
   xlcof = 0.125 * XJ3 / CK2 * sinio * (3 + 5 * cosio) / (1 + cosio);
   aycof = 0.25 * XJ3 / CK2 * sinio;
-}
-updateOrbitConfig();
-
-const SATS = [];
-for (let p = 0; p < PLANES; p++) {
-  for (let s = 0; s < SATS_PER_PLANE; s++) {
-    const idx = s + p * SATS_PER_PLANE;
-    const raan = (p * 30) * DEG;
-    const ma = ((p * (360 / TOTAL_SATS) + s * (360 / SATS_PER_PLANE)) % 360) * DEG;
-    SATS.push({ idx, plane: p, satInPlane: s, raan, ma });
-  }
+  rebuildSats();
 }
 
 function getSatState(sat, tSec) {
@@ -111,7 +129,7 @@ function getElevationDeg(site, satState) {
   return Math.asin(topZ / w) * RAD;
 }
 
-const STATIONS = [
+const DEFAULT_STATIONS = [
   { id: 0, name: "Goldstone (DSN)", lat: 35.42667, lon: -116.89, alt: 0, mobile: false },
   { id: 1, name: "Madrid (DSN)", lat: 40.43139, lon: -4.24806, alt: 0, mobile: false },
   { id: 2, name: "Canberra (DSN)", lat: -35.40139, lon: 148.98167, alt: 0, mobile: false },
@@ -137,7 +155,8 @@ function gcDist(a, b) {
 function gcInterp(a, b, f) {
   const p1 = a[0] * DEG, l1 = a[1] * DEG, p2 = b[0] * DEG, l2 = b[1] * DEG;
   const s1 = Math.sin((p2 - p1) / 2), s2 = Math.sin((l2 - l1) / 2);
-  const d = 2 * Math.atan2(Math.sqrt(s1 * s1 + Math.cos(p1) * Math.cos(p2) * s2 * s2), Math.sqrt(Math.max(0, 1 - (s1 * s1 + Math.cos(p1) * Math.cos(p2) * s2 * s2))));
+  const h = s1 * s1 + Math.cos(p1) * Math.cos(p2) * s2 * s2;
+  const d = 2 * Math.atan2(Math.sqrt(h), Math.sqrt(Math.max(0, 1 - h)));
   if (d < 1e-12) return { lat: a[0], lon: a[1] };
   const A = Math.sin((1 - f) * d) / Math.sin(d), B = Math.sin(f * d) / Math.sin(d);
   const x = A * Math.cos(p1) * Math.cos(l1) + B * Math.cos(p2) * Math.cos(l2);
@@ -145,16 +164,24 @@ function gcInterp(a, b, f) {
   const z = A * Math.sin(p1) + B * Math.sin(p2);
   return { lat: Math.atan2(z, Math.sqrt(x * x + y * y)) * RAD, lon: Math.atan2(y, x) * RAD };
 }
-for (const st of STATIONS) {
-  if (st.mobile) {
-    st.cum = [0];
-    for (let i = 1; i < st.route.length; i++) st.cum.push(st.cum[i - 1] + gcDist(st.route[i - 1], st.route[i]));
-  }
+
+function initStations(list) {
+  STATIONS = list.map(src => {
+    const st = { ...src, alt: src.alt || 0 };
+    if (st.mobile && Array.isArray(st.route) && st.route.length > 1) {
+      st.cum = [0];
+      for (let i = 1; i < st.route.length; i++) st.cum.push(st.cum[i - 1] + gcDist(st.route[i - 1], st.route[i]));
+    }
+    return st;
+  });
 }
+initStations(DEFAULT_STATIONS);
+updateOrbitConfig();
+
 function getStationPos(st, tSec) {
-  if (!st.mobile) return { id: st.id, name: st.name, lat: st.lat, lon: st.lon, alt: st.alt, mobile: false };
+  if (!st.mobile || !st.cum) return { id: st.id, name: st.name, lat: st.lat, lon: st.lon, alt: st.alt, mobile: !!st.mobile };
   const L = st.cum[st.cum.length - 1], period = 2 * L;
-  let d = (st.start * L + st.speed * tSec) % period;
+  let d = ((st.start || 0) * L + (st.speed || 0) * tSec) % period;
   if (d < 0) d += period;
   if (d > L) d = period - d;
   for (let i = 1; i < st.route.length; i++) {
